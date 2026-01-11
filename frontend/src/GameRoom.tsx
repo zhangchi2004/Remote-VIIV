@@ -27,6 +27,10 @@ export const GameRoom: React.FC<Props> = ({ gameId, mainPlayerId, mainPlayerName
         }
         return [{ id: mainPlayerId, name: mainPlayerName }];
     });
+
+    // Make Auto-Play default for Bots?
+    // Not easily propagated to GameClient props without changing interface
+    // But user can toggle manually in tabs.
     
     // Save clients to SessionStorage whenever it changes
     useEffect(() => {

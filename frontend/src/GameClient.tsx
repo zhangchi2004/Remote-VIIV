@@ -31,6 +31,12 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
     const myIdx = parseInt(playerId.split('_')[1] || "-1", 10);
     
     const [trickCards, setTrickCards] = useState<{player: number, cards: any[]}[]>([]); 
+    const [lastTrickCards, setLastTrickCards] = useState<{player: number, cards: any[]}[]>([]); 
+
+    // State Refs for Callback Access
+    const trickCardsRef = useRef(trickCards);
+    useEffect(() => { trickCardsRef.current = trickCards; }, [trickCards]);
+
     const [scores, setScores] = useState<{[key:number]: number}>({0:0, 1:0, 2:0});
     const [dealerIdx, setDealerIdx] = useState<number>(-1);
     const [players, setPlayers] = useState<{[key:number]: PlayerInfo}>({});
@@ -38,6 +44,9 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
     const [bottomCards, setBottomCards] = useState<Card[]>([]);
     const [showBottomOverlay, setShowBottomOverlay] = useState(false);
     const [bottomOverlayTimer, setBottomOverlayTimer] = useState<number>(10);
+    
+    // Debugging / Automation
+    const [isAutoPlay, setIsAutoPlay] = useState(false);
     
     const ws = useRef<WebSocket | null>(null);
 
@@ -169,7 +178,15 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
             case "TRICK_FINISHED":
                  setScores(msg.scores);
                  setCurrentTurn(msg.next_turn);
-                 setTimeout(() => setTrickCards([]), 2000); 
+                 
+                 // Move current trick to 'last trick' display buffer
+                 if (trickCardsRef.current) {
+                     setLastTrickCards(trickCardsRef.current);
+                 }
+                 setTrickCards([]); // Clear logical state immediately for new trick
+                 
+                 // Clear visual buffer after delay
+                 setTimeout(() => setLastTrickCards([]), 2000); 
                  break;
             case "GAME_OVER":
                  setPhase(GamePhase.FINISHED);
@@ -189,6 +206,86 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
         else newSet.add(id);
         setSelectedCardIds(newSet);
     };
+
+    // --- Helper for Auto Play ---
+    const getEffectiveSuit = (c: Card): string => {
+        if (c.rank === Rank.BIG_JOKER || c.rank === Rank.SMALL_JOKER) return "MAIN";
+        if (c.rank === currentLevel) return "MAIN";
+        if (c.rank === Rank.TWO) return "MAIN";
+        if (mainSuit && c.suit === mainSuit) return "MAIN";
+        return c.suit;
+    };
+
+    // Auto Play Logic
+    useEffect(() => {
+        if (!isAutoPlay) return;
+        if (!ws.current) return;
+
+        let timer: any;
+
+        const doAutoAction = () => {
+             // 1. Exchange Phase
+             if (phase === GamePhase.EXCHANGING && myIdx === dealerIdx) {
+                 // Discard last 6 cards (weakest)
+                 const last6 = sortedHand.slice(-6);
+                 if (last6.length === 6) {
+                     ws.current?.send(JSON.stringify({
+                         action: "EXCHANGE_CARDS",
+                         card_ids: last6.map(c => c.id)
+                     }));
+                     // Optimistic update
+                     const ids = last6.map(c => c.id);
+                     setHand(prev => prev.filter(c => !ids.includes(c.id)));
+                     // addLog("Auto Exchanged (Weakest 6)");
+                 }
+             }
+
+             // 2. Play Phase
+             if (phase === GamePhase.PLAYING && currentTurn === myIdx) {
+                 // Determine strategy
+                 let cardsToPlay: Card[] = [];
+                 
+                 // If leading (trickCards empty OR full from previous trick pending clear) -> Play 1st card
+                 const isLeading = trickCards.length === 0 || trickCards.length === 6;
+                 
+                 if (isLeading) {
+                     if (sortedHand.length > 0) cardsToPlay = [sortedHand[sortedHand.length - 1]]; // Play weakest (last in sorted)
+                 } else {
+                     // Following
+                     const leadCard = trickCards[0].cards[0];
+                     const leadSuit = getEffectiveSuit(leadCard); 
+                     
+                     // Find cards matching suit
+                     const matches = sortedHand.filter(c => getEffectiveSuit(c) === leadSuit);
+                     
+                     if (matches.length > 0) {
+                         cardsToPlay = [matches[matches.length - 1]]; // Follow with weakest valid
+                     } else {
+                         // No match, discard weakest
+                         if (sortedHand.length > 0) cardsToPlay = [sortedHand[sortedHand.length - 1]];
+                     }
+                 }
+
+                 if (cardsToPlay.length > 0) {
+                     ws.current?.send(JSON.stringify({
+                         action: "PLAY_CARDS",
+                         card_ids: cardsToPlay.map(c => c.id)
+                     }));
+                     // addLog(`Auto Playing ${cardsToPlay.length} cards`);
+                 }
+             }
+        };
+
+        // Check constantly or when dependencies change?
+        // Dependencies: phase, currentTurn, hand, trickCards
+        // We add a small delay
+        if ((phase === GamePhase.PLAYING && currentTurn === myIdx) || (phase === GamePhase.EXCHANGING && myIdx === dealerIdx)) {
+            timer = setTimeout(doAutoAction, 1000);
+        }
+
+        return () => clearTimeout(timer);
+    }, [isAutoPlay, phase, currentTurn, trickCards, hand]); // Dependencies
+
 
     const declareMain = () => {
         if (selectedCardIds.size === 0) return;
@@ -263,8 +360,12 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
         const name = (playerInfo && playerInfo.name) ? playerInfo.name : `Seat ${absIdx}`;
         const isTurn = absIdx === currentTurn;
         
-        // Find cards played by this player in current trick
-        const playedMove = trickCards.find(m => m.player === absIdx);
+        // Find cards played by this player in current trick OR last trick (fading)
+        const currentMove = trickCards.find(m => m.player === absIdx);
+        const lastMove = lastTrickCards.find(m => m.player === absIdx);
+        
+        const displayCards = currentMove ? currentMove.cards : (lastMove ? lastMove.cards : null);
+        const isFaded = !currentMove && lastMove;
         
         return (
             <div key={absIdx} className={`relative flex flex-col items-center justify-start w-1/3 h-full border border-white/5 p-2
@@ -282,9 +383,9 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
                  
                  {/* Played Cards Area */}
                  <div className="flex-1 w-full flex items-center justify-center"> 
-                      {playedMove ? (
-                          <div className="flex flex-row gap-1">
-                              {playedMove.cards.map((c: any, i) => (
+                      {displayCards ? (
+                          <div className={`flex flex-row gap-1 ${isFaded ? "opacity-50 grayscale transition-opacity duration-1000" : ""}`}>
+                              {displayCards.map((c: any, i: number) => (
                                   <div key={i} className="transform hover:scale-150 transition-transform origin-bottom">
                                       <CardView card={c} small />
                                   </div>
@@ -339,6 +440,14 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
             <div className="h-40 bg-gray-900/90 border-t border-yellow-600 relative z-30 flex flex-col items-center">
                  {/* Controls */}
                  <div className="h-8 flex items-center gap-2 mt-1">
+                      {/* Auto Play Toggle */}
+                      <button 
+                        onClick={() => setIsAutoPlay(!isAutoPlay)}
+                        className={`px-2 py-0.5 text-xs rounded border ${isAutoPlay ? "bg-green-600 border-green-400 text-white" : "bg-gray-800 border-gray-600 text-gray-400"}`}
+                      >
+                          Auto: {isAutoPlay ? "ON" : "OFF"}
+                      </button>
+
                       {phase === GamePhase.DRAWING && (
                            <button onClick={declareMain} className="bg-blue-700 px-3 py-0.5 rounded text-white text-xs hover:bg-blue-600">Declare</button>
                       )}
