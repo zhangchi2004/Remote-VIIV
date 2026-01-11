@@ -4,7 +4,7 @@ import { useParams } from 'react-router-dom'; // Assuming I can add params parsi
 // But sticking to a single "Lobby" flow is better.
 // Let's assume App.tsx passes gameId and mainPlayerId.
 
-import { joinGame, startGame } from './api';
+import { joinGame, startGame, getGameInfo } from './api';
 import { GameClient } from './GameClient';
 
 interface Props {
@@ -21,18 +21,29 @@ export const GameRoom: React.FC<Props> = ({ gameId, mainPlayerId, mainPlayerName
     const [activeTab, setActiveTab] = useState<string>(mainPlayerId);
 
     const spawnBots = async () => {
-        // Create 5 bots
-        const newClients = [];
-        for (let i = 1; i <= 5; i++) {
-            const name = `Bot_${i}`;
-            try {
-                const res = await joinGame(gameId, name);
-                newClients.push({ id: res.player_id, name });
-            } catch (e) {
-                console.error("Failed to join bot", e);
+        try {
+            const info = await getGameInfo(gameId);
+            if (!info || !info.seats) return;
+
+            const newClients = [];
+            let botIdx = 1;
+
+            for (const seat of info.seats) {
+                if (seat.name === null) {
+                    const name = `Bot_${botIdx}`;
+                    try {
+                        const res = await joinGame(gameId, name, seat.seat_index);
+                        newClients.push({ id: res.player_id, name });
+                        botIdx++;
+                    } catch (e) {
+                        console.error("Failed to join bot", e);
+                    }
+                }
             }
+            setClients(prev => [...prev, ...newClients]);
+        } catch (e) {
+            console.error("Failed spawning bots", e);
         }
-        setClients(prev => [...prev, ...newClients]);
     };
 
     const handleStart = async () => {

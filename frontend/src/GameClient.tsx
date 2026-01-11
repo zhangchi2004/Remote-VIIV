@@ -1,17 +1,19 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Card, GamePhase, Suit, Rank } from './types';
 import { CardView } from './components/CardView';
-import { GameLogic } from './gameLogic';
-
-// Helper to determine if we should enable "Bot Mode" for this client?
-// User asked for "one user debug". Switching tabs manually is fine.
-// But some automation for "Pass" or "Skip" is nice? 
-// No, strict rules mean we have to play carefully. Manual is best.
+import { getGameInfo } from './api';
+// import { GameLogic } from './gameLogic'; // Logic moved to backend
 
 interface Props {
     gameId: string;
     playerId: string;
-    isActive: boolean; // Is this the currently viewable tab?
+    isActive: boolean; 
+}
+
+interface PlayerInfo {
+    seat_index: number;
+    name: string;
+    team: number;
 }
 
 export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
@@ -24,81 +26,64 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
     const [mainSuit, setMainSuit] = useState<Suit | null>(null);
     const [currentLevel, setCurrentLevel] = useState<number>(3);
     const [currentTurn, setCurrentTurn] = useState<number>(-1);
-    const [myIdx, setMyIdx] = useState<number>(-1);
-    const [trickCards, setTrickCards] = useState<{player: number, cards: string[]}[]>([]);
+    
+    // Derived from props
+    const myIdx = parseInt(playerId.split('_')[1] || "-1", 10);
+    
+    const [trickCards, setTrickCards] = useState<{player: number, cards: any[]}[]>([]); 
     const [scores, setScores] = useState<{[key:number]: number}>({0:0, 1:0, 2:0});
     const [dealerIdx, setDealerIdx] = useState<number>(-1);
+    const [players, setPlayers] = useState<{[key:number]: PlayerInfo}>({});
+
+    const [bottomCards, setBottomCards] = useState<Card[]>([]);
+    const [showBottomOverlay, setShowBottomOverlay] = useState(false);
+    const [bottomOverlayTimer, setBottomOverlayTimer] = useState<number>(10);
     
     const ws = useRef<WebSocket | null>(null);
 
-    // Initial State Fetch? No, rely on WS for updates or fetch once.
-    // Ideally we fetch state on mount to sync up.
-    
+    // Initial Setup
     useEffect(() => {
-        // Parse My Index
-        const idx = parseInt(playerId.split('_')[1]);
-        if (!isNaN(idx)) setMyIdx(idx);
+        // Fetch Player Names
+        getGameInfo(gameId).then(info => {
+            if (info && info.seats) {
+                const map: any = {};
+                info.seats.forEach((s: any) => map[s.seat_index] = s);
+                setPlayers(map);
+            }
+        });
 
         // Connect WS
         const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
         const host = window.location.host; 
-        // Vite proxy setup forces us to use relatives or explicit host.
-        // If running dev server, it's usually localhost:5173 -> proxy localhost:8000
-        // So ws://localhost:5173/ws/... should proxy.
-        
-        const socket = new WebSocket(`ws://${host}/ws/${gameId}/${playerId}`);
+        const socket = new WebSocket(`${protocol}://${host}/ws/${gameId}/${playerId}`);
         ws.current = socket;
 
-        socket.onopen = () => {
-            addLog("Connected");
-        };
-
-        socket.onmessage = (event) => {
-            const msg = JSON.parse(event.data);
-            handleMessage(msg);
-        };
-
+        socket.onopen = () => addLog("Connected");
+        socket.onmessage = (event) => handleMessage(JSON.parse(event.data));
         socket.onclose = () => addLog("Disconnected");
 
         return () => {
-            socket.close();
+             if (ws.current) ws.current.close();
         };
-    }, [gameId, playerId]);
+    },  [gameId, playerId]);
 
-    // Advanced Sorting Logic for UI
-    // Group: Main Cards (Jokers, Level, 2s, MainSuit) > Sub Suits
+    // HAND SORTING
     const sortedHand = [...hand].sort((a, b) => {
         const getScore = (c: Card) => {
             if (c.rank === Rank.BIG_JOKER) return 10000;
             if (c.rank === Rank.SMALL_JOKER) return 9000;
+            if (c.rank === currentLevel) return (c.suit === mainSuit) ? 8500 : 8000;
+            if (c.rank === Rank.TWO) return (c.suit === mainSuit) ? 7500 : 7000;
+            if (mainSuit && c.suit === mainSuit) return 6000 + c.rank;
             
-            // Level Cards
-            if (c.rank === currentLevel) {
-                 return (c.suit === mainSuit) ? 8500 : 8000;
-            }
-            
-            // Twos
-            if (c.rank === Rank.TWO) {
-                 return (c.suit === mainSuit) ? 7500 : 7000;
-            }
-            
-            // Main Suit
-            if (mainSuit && c.suit === mainSuit) {
-                 return 6000 + c.rank;
-            }
-            
-            // Sub Suits
-            // Group by suit constant order
             let suitScore = 0;
             if (c.suit === Suit.SPADES) suitScore = 4000;
             else if (c.suit === Suit.HEARTS) suitScore = 3000;
             else if (c.suit === Suit.CLUBS) suitScore = 2000;
             else if (c.suit === Suit.DIAMONDS) suitScore = 1000;
-            
             return suitScore + c.rank;
         };
-        
-        return getScore(b) - getScore(a); // Descending
+        return getScore(b) - getScore(a);
     });
 
     const handleMessage = (msg: any) => {
@@ -108,10 +93,25 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
                 setPhase(GamePhase.DRAWING);
                 break;
             case "DRAWING_COMPLETE":
-                setPhase(GamePhase.DRAWING); // Actually it finishes, check payload
                 if (msg.main_suit) setMainSuit(msg.main_suit);
                 setDealerIdx(msg.dealer_idx);
-                addLog(`Drawing Complete. Main Suit: ${msg.main_suit || "None"}. Dealer: ${msg.dealer_idx}`);
+                addLog(`Drawing Complete. Dealer: Seat ${msg.dealer_idx}`);
+                break;
+            case "BOTTOM_CARDS_REVEAL":
+                setBottomCards(msg.bottom_cards);
+                setShowBottomOverlay(true);
+                setBottomOverlayTimer(10);
+                const timer = setInterval(() => {
+                    setBottomOverlayTimer(prev => {
+                        if (prev <= 1) {
+                            clearInterval(timer);
+                            setShowBottomOverlay(false);
+                            return 0;
+                        }
+                        return prev - 1;
+                    });
+                }, 1000);
+                addLog("Bottom cards revealed (10s)");
                 break;
             case "EXCHANGE_START":
                 setPhase(GamePhase.EXCHANGING);
@@ -122,40 +122,39 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
                 break;
             case "MAIN_DECLARED":
                 setMainSuit(msg.suit);
-                addLog(`Player ${msg.player_idx} declared ${msg.suit} (Strength ${msg.strength})`);
+                addLog(`Main Declared: ${msg.suit}`);
                 break;
             case "GAME_START_PLAY":
                 setPhase(GamePhase.PLAYING);
                 setCurrentTurn(msg.current_turn);
                 setTrickCards([]);
-                addLog("Game Started!");
                 break;
             case "PLAYER_PLAYED":
-                 // msg.cards is list of strings? No, backend sent list of strings in my simplified code.
-                 // Need to parse if possible or display text.
                  setTrickCards(prev => [...prev, { player: msg.player_idx, cards: msg.cards }]);
                  setCurrentTurn(msg.next_turn);
+                 // If I played, remove cards from hand now (Backend Authority)
+                 if (msg.player_idx === myIdx) {
+                    const playedIds = msg.cards.map((c: any) => c.id);
+                    setHand(prev => prev.filter(c => !playedIds.includes(c.id)));
+                    setSelectedCardIds(new Set());
+                 }
                  break;
             case "TRICK_FINISHED":
-                 addLog(`Trick Winner: ${msg.winner_idx}. Points: ${msg.points}`);
                  setScores(msg.scores);
                  setCurrentTurn(msg.next_turn);
-                 setTimeout(() => setTrickCards([]), 2000); // Clear table after delay
-                 break;
-            case "ERROR":
-                 alert("Error: " + msg.message);
+                 setTimeout(() => setTrickCards([]), 2000); 
                  break;
             case "GAME_OVER":
                  setPhase(GamePhase.FINISHED);
-                 setScores(msg.scores);
-                 addLog("Game Over!");
+                 alert("Game Over!");
                  break;
-            default:
-                 console.log("Unknown msg", msg);
+            case "ERROR":
+                 alert(msg.message);
+                 break;
         }
     };
 
-    const addLog = (txt: string) => setLogs(prev => [txt, ...prev].slice(0, 50));
+    const addLog = (txt: string) => setLogs(prev => [txt, ...prev].slice(0, 10));
 
     const toggleSelect = (id: string) => {
         const newSet = new Set(selectedCardIds);
@@ -164,11 +163,8 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
         setSelectedCardIds(newSet);
     };
 
-    // Actions
     const declareMain = () => {
         if (selectedCardIds.size === 0) return;
-        // Prompt for suit if Joker? Simplified: Assume non-joker or guess.
-        // For UI simplicity, just send first card's suit.
         const firstId = Array.from(selectedCardIds)[0];
         const card = hand.find(c => c.id === firstId);
         if (!card) return;
@@ -195,232 +191,171 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
              action: "EXCHANGE_CARDS",
              card_ids: Array.from(selectedCardIds)
          }));
-         // Optimistic removal
          const ids = Array.from(selectedCardIds);
          setHand(prev => prev.filter(c => !ids.includes(c.id)));
          setSelectedCardIds(new Set());
     };
-
+    
     const playCards = () => {
         if (selectedCardIds.size === 0) return;
         
-        const playingCards = hand.filter(c => selectedCardIds.has(c.id));
-        
-        // --- Frontend Validation ---
-        // 1. Validate Lead or Follow
-        // Check if I am Leader. 
-        // Logic: active player is currentTurn. If check trickCards is empty?
-        // Wait, trickCards updates via WS. If everyone else played, trickCards.length > 0.
-        // If it's my turn and trickCards.length == 0 => I am Leader.
-        // If trickCards.length > 0 => I am Follower.
-        
-        const isLeader = trickCards.length === 0;
-        
-        if (isLeader) {
-            if (!GameLogic.validateLeadTurn(playingCards)) {
-                 alert("Invalid Lead! Must be Single, Pair, Triple, or Quad of Identical cards.");
-                 return;
-            }
-        } else {
-            // Validate Follow
-            const leaderMove = trickCards[0]; // { player, cards: ["♠A", ...] }
-            // Must convert leader cards strings to Dummy Cards for validation
-            const leaderCardsObj = leaderMove.cards.map(s => {
-                const parsed = GameLogic.parseBackendCardString(s);
-                // We need an ID for interface, but logic doesn't use it.
-                return { id: "dummy", suit: parsed?.suit, rank: parsed?.rank } as Card;
-            }).filter(c => c.suit && c.rank); // Filter nulls? Logic assumes valid
-            
-            if (leaderCardsObj.length !== leaderMove.cards.length) {
-                console.error("Failed to parse leader cards", leaderMove.cards);
-                alert("Internal Error parsing leader cards");
-                return;
-            }
-
-            const result = GameLogic.validateFollowTurn(
-                leaderCardsObj, 
-                playingCards, 
-                hand, 
-                mainSuit, 
-                currentLevel
-            );
-
-            if (!result.valid) {
-                 alert("Invalid Follow: " + result.message);
-                 return;
-            }
-        }
-        
         ws.current?.send(JSON.stringify({
-            action: "PLAY_CARDS",
-            card_ids: Array.from(selectedCardIds)
+             action: "PLAY_CARDS",
+             card_ids: Array.from(selectedCardIds)
         }));
-        // Optimistic removal
-         const ids = Array.from(selectedCardIds);
-         setHand(prev => prev.filter(c => !ids.includes(c.id)));
-         setSelectedCardIds(new Set());
+        // Note: We do NOT remove cards or clear selection here. 
+        // We wait for specific WebSocket events:
+        // - PLAYER_PLAYED: Success -> Hand updated, selection cleared.
+        // - ERROR: Fail -> Alert shown, selection remains for retry.
     };
 
-    const dealerTeam = dealerIdx !== -1 ? dealerIdx % 3 : -1;
-    // Catching teams are the other two.
-    // E.g. If dealer is 0 (Team 0). Catching are Team 1 and Team 2.
-    // Display Scores
-    const renderScores = () => {
-        if (dealerTeam === -1) return null;
-        return (
-            <div className="flex gap-4 text-sm font-mono">
-                {Object.entries(scores).map(([teamId, score]) => {
-                    const tid = parseInt(teamId);
-                    const isDealerTeam = tid === dealerTeam;
-                    return (
-                        <div key={tid} className={isDealerTeam ? "text-yellow-400" : "text-green-400"}>
-                             Team {tid} {isDealerTeam ? "(Dealer)" : "(Catching)"}: {score}
-                        </div>
-                    );
-                })}
-            </div>
-        );
-    };
+    // --- Layout Rendering ---
+    
+    const getRelativeIdx = (absIdx: number) => (absIdx - myIdx + 6) % 6;
+    
+    // Positions helper
+    // 0: Me (Bottom) - Handled separately? No, let's put it in the grid.
+    // 1: Right Bot
+    // 2: Right Top
+    // 3: Top
+    // 4: Left Top
+    // 5: Left Bot
+    
+    // We want 2 rows of 3 columns.
+    // Top Row: 4 (Left) - 3 (Center) - 2 (Right)
+    // Bot Row: 5 (Left) - 0 (Center) - 1 (Right)
 
-    // Render Trick Table Layout
-    // Two rows of three. Self at bottom center.
-    // Row 1 (Top): [Left Top, Top Center, Right Top]
-    // Row 2 (Bottom): [Left Bottom, Self, Right Bottom]
-    // Relative locations: 
-    // Self = 0.
-    // Order of play is usually 0 -> 1 -> 2 ...
-    // If we map:
-    // [4, 3, 2]
-    // [5, 0, 1]
-    
-    // Relative Index logic: (pIdx - myIdx + 6) % 6
-    // 0 -> Me -> Pos 0 (Bottom Center)
-    // 1 -> Right -> Pos 1 (Bottom Right)
-    // 2 -> Right Top -> Pos 2 (Top Right)
-    // 3 -> Top -> Pos 3 (Top Center)
-    // 4 -> Left Top -> Pos 4 (Top Left)
-    // 5 -> Left -> Pos 5 (Bottom Left)
-    
-    // We render 6 slots.
-    const renderTable = () => {
-        // Create a map of relative_pos -> played cards
-        const positionMap: {[key:number]: string[]} = {}; // key 0-5
+    const renderPlayerSlot = (absIdx: number) => {
+        const playerInfo = players[absIdx];
+        const name = (playerInfo && playerInfo.name) ? playerInfo.name : `Seat ${absIdx}`;
+        const isTurn = absIdx === currentTurn;
         
-        trickCards.forEach(move => {
-            const rel = (move.player - myIdx + 6) % 6;
-            positionMap[rel] = move.cards;
-        });
-
-        // Helper to render a card set
-        const renderSlot = (relPos: number, label: string) => {
-            const cards = positionMap[relPos];
-            return (
-                <div className="w-32 h-20 bg-white/10 border border-white/20 rounded flex flex-col items-center justify-center p-1 relative">
-                    <span className="text-[10px] text-gray-400 absolute top-0 left-1">{label}</span>
-                    {cards ? (
-                         <div className="flex -space-x-4">
-                            {cards.map((c, i) => (
-                                <div key={i} className="w-8 h-12 bg-white text-black border shadow-sm flex items-center justify-center text-[10px] rounded">
-                                    {c}
-                                </div>
-                            ))}
-                         </div>
-                    ) : (
-                        <span className="text-white/10 text-xs">Waiting...</span>
-                    )}
-                </div>
-            );
-        };
-
+        // Find cards played by this player in current trick
+        const playedMove = trickCards.find(m => m.player === absIdx);
+        
         return (
-            <div className="flex flex-col gap-4 items-center mt-8">
-                 {/* Top Row: 4, 3, 2 (Left Top, Top, Right Top) */}
-                 <div className="flex gap-16">
-                     {renderSlot(4, "Left Top")}
-                     {renderSlot(3, "Top")}
-                     {renderSlot(2, "Right Top")}
-                 </div>
+            <div key={absIdx} className={`relative flex flex-col items-center justify-start w-1/3 h-full border border-white/5 p-2
+                ${isTurn ? "bg-yellow-900/20" : ""}
+            `}>
+                 {/* Avatar / Name Box */}
+                <div className={`
+                    flex items-center gap-2 px-3 py-1 rounded bg-gray-800 text-white font-bold text-sm mb-2 shadow
+                    ${isTurn ? "ring-2 ring-yellow-400 animate-pulse" : "ring-1 ring-gray-600"}
+                `}>
+                    <span>{name}</span>
+                    <span className="text-xs text-gray-400 opacity-70">#{absIdx}</span>
+                    {dealerIdx === absIdx && <span className="text-yellow-500">★</span>}
+                </div>
                  
-                 {/* Bottom Row: 5, 0, 1 (Left Bot, Me, Right Bot) */}
-                 <div className="flex gap-16">
-                     {renderSlot(5, "Left Bot")}
-                     <div className="relative">
-                         {renderSlot(0, "Me")}
-                         {/* Highlight if my turn */}
-                         {currentTurn === myIdx && (
-                             <div className="absolute -bottom-2 w-full h-1 bg-yellow-400 animate-pulse" />
-                         )}
-                     </div>
-                     {renderSlot(1, "Right Bot")}
+                 {/* Played Cards Area */}
+                 <div className="flex-1 w-full flex items-center justify-center"> 
+                      {playedMove ? (
+                          <div className="flex flex-row gap-1">
+                              {playedMove.cards.map((c: any, i) => (
+                                  <div key={i} className="transform hover:scale-150 transition-transform origin-bottom">
+                                      <CardView card={c} small />
+                                  </div>
+                              ))}
+                          </div>
+                      ) : (
+                          isTurn && phase === GamePhase.PLAYING ? (
+                              <div className="text-yellow-200/50 text-xs italic">Thinking...</div>
+                          ) : null
+                      )}
                  </div>
             </div>
         );
     };
 
-    if (!isActive) return null; // Or render hidden for state persistence? 
-    // If we return null, component unmounts and WS closes. 
-    // We must render but hide it with CSS OR lift state up.
-    // But lifting state for 6 players is messy.
-    // The parent should manage visibility style, not conditional rendering.
-    
     return (
-        <div className="flex flex-col h-full bg-gray-900 p-2 text-white overflow-hidden">
+        <div className="w-full h-full bg-green-900 relative overflow-hidden flex flex-col">
+            
             {/* Top Info Bar */}
-            <div className="flex justify-between bg-gray-800 p-2 rounded mb-2 items-center">
-                <div className="text-xs">
-                    <div>PID: {playerId}</div>
-                    <div>{phase}</div>
+            <div className="h-8 bg-black/40 flex justify-between px-4 items-center text-white text-xs z-20">
+                <div>Room: {gameId} | Phase: {phase} | Level: {currentLevel} | Main: {mainSuit || "?"}</div>
+                <div className="flex gap-4 font-mono">
+                     <div className="text-red-300">Team 0: {scores[0]}</div>
+                     <div className="text-blue-300">Team 1: {scores[1]}</div>
+                     <div className="text-yellow-300">Team 2: {scores[2]}</div>
+                </div>
+            </div>
+
+            {/* Main Table Area (Opponents + Played Cards) */}
+            <div className="flex-1 flex flex-col w-full max-w-5xl mx-auto py-2">
+                {/* Top Row: 4, 3, 2 */}
+                <div className="flex-1 flex w-full"> 
+                    {renderPlayerSlot((myIdx + 4) % 6)}
+                    {renderPlayerSlot((myIdx + 3) % 6)}
+                    {renderPlayerSlot((myIdx + 2) % 6)}
                 </div>
                 
-                <div className="flex-1 flex justify-center">
-                   {renderScores()}
-                </div>
-
-                <div className="text-xs text-right">
-                    <div>Main: {mainSuit || "?"}</div>
-                    <div>Turn: {currentTurn}</div>
+                {/* Bottom Row: 5, 0, 1 */}
+                <div className="flex-1 flex w-full"> 
+                    {renderPlayerSlot((myIdx + 5) % 6)}
+                    {renderPlayerSlot(myIdx)}
+                    {renderPlayerSlot((myIdx + 1) % 6)}
                 </div>
             </div>
 
-            {/* Table Area */}
-            <div className="flex-1 bg-green-900 rounded relative p-4 mb-2 overflow-y-auto flex items-center justify-center">
-                <div className="absolute top-2 left-2 text-green-200 opacity-20 text-4xl font-bold">TABLE</div>
-                {renderTable()}
+            {/* Logs Overlay (Minimizable) */}
+            <div className="absolute top-10 left-2 w-48 max-h-32 overflow-y-auto bg-black/40 text-xxs text-green-300 pointer-events-none rounded p-1">
+                 {logs.map((L, i) => <div key={i}>{L}</div>)}
             </div>
 
-            {/* Hand Area */}
-            <div className="h-48 bg-gray-800 rounded p-2 overflow-x-auto flex items-end space-x-[-30px] pr-8">
-                {sortedHand.map(card => (
-                    <CardView 
-                        key={card.id} 
-                        card={card} 
-                        selected={selectedCardIds.has(card.id)}
-                        onClick={() => toggleSelect(card.id)}
-                    />
-                ))}
+            {/* My Hand Area (Docked Bottom) */}
+            <div className="h-40 bg-gray-900/90 border-t border-yellow-600 relative z-30 flex flex-col items-center">
+                 {/* Controls */}
+                 <div className="h-8 flex items-center gap-2 mt-1">
+                      {phase === GamePhase.DRAWING && (
+                           <button onClick={declareMain} className="bg-blue-700 px-3 py-0.5 rounded text-white text-xs hover:bg-blue-600">Declare</button>
+                      )}
+                      
+                      {phase === GamePhase.EXCHANGING && (
+                           <button onClick={exchangeCards} className="bg-purple-700 px-3 py-0.5 rounded text-white text-xs hover:bg-purple-600">Exchange</button>
+                      )}
+                      
+                      {phase === GamePhase.PLAYING && currentTurn === myIdx && (
+                           <button onClick={playCards} className="bg-green-700 px-6 py-0.5 rounded text-white text-sm font-bold hover:bg-green-600">PLAY</button>
+                      )}
+                      
+                      <div className="text-gray-400 text-xs ml-4">Sel: {selectedCardIds.size}</div>
+                 </div>
+                 
+                 {/* Cards Scroll */}
+                 <div className="flex-1 w-full overflow-x-auto flex items-end justify-center pb-2 px-4"> 
+                    <div className="flex flex-row" style={{ marginLeft: 50, marginRight: 50 }}>
+                        {sortedHand.map((c, i) => (
+                            <div 
+                                key={c.id} 
+                                onClick={() => toggleSelect(c.id)}
+                                className={`
+                                    transition-transform hover:-translate-y-4 cursor-pointer relative
+                                    ${selectedCardIds.has(c.id) ? "-translate-y-6 z-10" : ""}
+                                `}
+                                style={{ marginLeft: i === 0 ? 0 : '-1.8rem' }} 
+                            >
+                                <CardView card={c} selected={selectedCardIds.has(c.id)} />
+                                {selectedCardIds.has(c.id) && <div className="absolute inset-0 border-2 border-yellow-400 rounded-lg pointer-events-none"></div>}
+                            </div>
+                        ))}
+                    </div>
+                 </div>
             </div>
 
-            {/* Controls */}
-            <div className="h-16 flex items-center gap-2 mt-2">
-                {phase === GamePhase.DRAWING && (
-                    <button onClick={declareMain} className="bg-yellow-600 px-4 py-2 rounded hover:bg-yellow-500">
-                        Declare Main
-                    </button>
-                )}
-                {phase === GamePhase.EXCHANGING && (
-                    <button onClick={exchangeCards} className="bg-purple-600 px-4 py-2 rounded hover:bg-purple-500">
-                        Confirm Exchange (6)
-                    </button>
-                )}
-                {phase === GamePhase.PLAYING && currentTurn === parseInt(playerId.split('_')[1] || "999") && ( // Hacky ID check or use API provided index
-                    <button onClick={playCards} className="bg-blue-600 px-4 py-2 rounded hover:bg-blue-500">
-                        Play Selected
-                    </button>
-                )}
-                <div className="text-xs text-gray-400 ml-auto w-64 h-full overflow-y-auto bg-black p-1 font-mono">
-                    {logs.map((l, i) => <div key={i}>{l}</div>)}
+            {/* Bottom Cards Overlay */}
+            {showBottomOverlay && (
+                <div className="absolute inset-0 z-50 bg-black/90 flex flex-col items-center justify-center">
+                    <h2 className="text-3xl text-yellow-400 font-bold mb-4 animate-bounce">Bottom Cards</h2>
+                    <div className="flex gap-4 mb-4">
+                        {bottomCards.map((c, i) => (
+                            <div key={i} className="transform scale-125">
+                                <CardView card={c} />
+                            </div>
+                        ))}
+                    </div>
+                    <div className="text-white font-mono text-xl">Closing in {bottomOverlayTimer}s...</div>
                 </div>
-            </div>
+            )}
         </div>
     );
 };

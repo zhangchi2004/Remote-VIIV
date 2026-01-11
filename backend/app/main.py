@@ -94,11 +94,21 @@ async def dealing_phase_task(game_id: str):
             "dealer_idx": final_info["dealer_idx"]
         }, game_id)
         
-        # Notify Dealer about Bottom Cards
-        dealer_p = game.players[final_info["dealer_idx"]]
-        
         # Serialize bottom cards
         bottom_cards_formatted = [{"suit": c.suit, "rank": c.rank, "id": c.id} for c in final_info["bottom_cards"]]
+
+        # REVEAL BOTTOM CARDS TO EVERYONE BEFORE EXCHANGE
+        await manager.broadcast({
+            "type": "BOTTOM_CARDS_REVEAL",
+            "bottom_cards": bottom_cards_formatted,
+            "message": "Bottom cards revealed for 10 seconds."
+        }, game_id)
+
+        # Wait 10 seconds
+        await asyncio.sleep(10)
+
+        # Notify Dealer about Bottom Cards and Start Exchange
+        dealer_p = game.players[final_info["dealer_idx"]]
         
         await manager.send_personal_message({
             "type": "EXCHANGE_START",
@@ -114,6 +124,7 @@ class GameCreate(BaseModel):
 
 class PlayerJoin(BaseModel):
     name: str
+    seat_index: int
 
 @app.post("/games/")
 def create_game(game_data: GameCreate):
@@ -128,11 +139,32 @@ def join_game(game_id: str, player: PlayerJoin):
     
     game = games[game_id]
     try:
-        pid = f"player_{len(game.players)}" # Simple ID
-        game.add_player(pid, player.name)
-        return {"player_id": pid, "team": game.players[-1].team_id}
+        pid = f"player_{player.seat_index}" # ID bound to seat for simplicity
+        game.add_player(pid, player.name, player.seat_index)
+        
+        # Safe access to player we just added
+        p_obj = game.players[player.seat_index]
+        return {"player_id": pid, "team": p_obj.team_id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/games/{game_id}/state")
+def get_game_state(game_id: str):
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Game not found")
+    game = games[game_id]
+    # Return simple state about seats
+    seats = []
+    for i, p in enumerate(game.players):
+        if p:
+            seats.append({"seat_index": i, "name": p.name, "id": p.id, "team": p.team_id})
+        else:
+             seats.append({"seat_index": i, "name": None, "id": None, "team": None})
+             
+    return {
+        "phase": game.phase,
+        "seats": seats
+    }
 
 @app.post("/games/{game_id}/start")
 async def start_game(game_id: str, background_tasks: BackgroundTasks):
@@ -154,7 +186,7 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
         
     game = games[game_id]
     # Verify player exists
-    player_obj = next((p for p in game.players if p.id == player_id), None)
+    player_obj = next((p for p in game.players if p and p.id == player_id), None)
     if not player_obj:
         await websocket.close(code=4001)
         return
@@ -209,46 +241,18 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
                 # { action: "PLAY_CARDS", card_ids: ["..."] }
                 card_ids = data.get("card_ids", [])
                 try:
+                    # Capture card objects for broadcast consistency
+                    player = game.players[player_idx]
+                    cards_objs = [c for c in player.hand if c.id in card_ids]
+                    cards_serialized = [{"suit": c.suit, "rank": c.rank, "id": c.id} for c in cards_objs]
+                    
                     # Execute Play
                     trick_result = game.play_cards(player_idx, card_ids)
-                    
-                    # Broadcast Move
-                    played_cards_data = []
-                    # We need to reconstruct card objects or just send IDs?
-                    # Since we removed them from hand, we can't easily look them up if we only have IDs,
-                    # unless we kept the card data in the `trick`.
-                    # `game.current_trick` (or result) has the card objects (or dicts).
-                    # `play_cards` returns `trick_result` ONLY if trick is finished.
-                    # But we need to broadcast the move immediately.
-                    
-                    # Wait, `play_cards` logic:
-                    # It updates `self.current_trick`.
-                    # Let's broadcast "PLAYER_PLAYED" first.
-                    
-                    # Need to retrieve Card details to show other players?
-                    # Game uses `Card` objects.
-                    # Let's fetch the last move from `game.current_trick` if trick_result is None,
-                    # OR from `result` if it is finished.
-                    
-                    played_cards_objs = []
-                    if trick_result:
-                        # It was the last move. 
-                        # trick_result["trick_cards"] has the full history. 
-                        # We just want the last one.
-                        last_move = trick_result["trick_cards"][-1]
-                        # This structure in `trick_result` is formatted strings.
-                        # Ideally, we broadcast the RAW card details so UI can render.
-                        # But `game.py` return value for trick_result used strings.
-                        cards_display = last_move[1]
-                    else:
-                        # Game state handling
-                        last_move = game.current_trick[-1]
-                        cards_display = [str(c) for c in last_move[1]]
                     
                     await manager.broadcast({
                         "type": "PLAYER_PLAYED",
                         "player_idx": player_idx,
-                        "cards": cards_display, # Or better objects
+                        "cards": cards_serialized,
                         "next_turn": game.current_turn_index
                     }, game_id)
                     
@@ -267,6 +271,12 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
                                 "type": "GAME_OVER",
                                 "scores": game.scores
                             }, game_id)
+
+                except ValueError as e:
+                    await manager.send_personal_message({
+                        "type": "ERROR",
+                        "message": str(e)
+                    }, game_id, player_id)
                             
                 except ValueError as e:
                     await manager.send_personal_message({
@@ -287,7 +297,7 @@ def get_state(game_id: str, player_id: str):
     game = games[game_id]
     
     # Find player
-    p = next((p for p in game.players if p.id == player_id), None)
+    p = next((p for p in game.players if p and p.id == player_id), None)
     if not p:
         raise HTTPException(status_code=404, detail="Player not found")
         

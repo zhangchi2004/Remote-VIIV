@@ -22,7 +22,9 @@ class Declaration:
 
 class Game:
     def __init__(self):
-        self.players: List[Player] = []
+        # We need a fixed list of 6 seats.
+        # self.players[i] is the player at seat i.
+        self.players: List[Optional[Player]] = [None] * 6
         self.phase: GamePhase = GamePhase.WAITING
         self.deck = Deck()
         
@@ -40,31 +42,32 @@ class Game:
         
         # Round State
         self.current_trick: List[tuple] = [] # (player_idx, cards)
-        self.points_team_1 = 0 # Teams 0, 2, 4 vs 1, 3, 5? "Opposite pairs are groups".
-        # 6 players. 
-        # Team A: 0, 2, 4 ?? No, "Opposite pairs".
-        # If seating is circular 0-1-2-3-4-5.
-        # 0 & 3 are partners? 
-        # 1 & 4 are partners.
-        # 2 & 5 are partners.
-        # "Three groups fighting each other".
-        # Group 1: 0, 3
-        # Group 2: 1, 4
-        # Group 3: 2, 5
+        self.points_team_1 = 0 
         
         self.scores = {0: 0, 1: 0, 2: 0} # Scores for team 0, 1, 2
         
-    def add_player(self, player_id: str, name: str):
-        if len(self.players) >= 6:
-            raise ValueError("Room full")
+    def add_player(self, player_id: str, name: str, seat_idx: int):
+        if seat_idx < 0 or seat_idx >= 6:
+            raise ValueError("Invalid seat index (0-5)")
+        if self.players[seat_idx] is not None:
+             raise ValueError("Seat already taken")
         
-        # Groups: 0,1,2,0,1,2 cycling
-        team_id = len(self.players) % 3
+        # Determine team based on seat
+        team_id = seat_idx % 3
         p = Player(id=player_id, name=name, team_id=team_id)
-        self.players.append(p)
+        self.players[seat_idx] = p
+
+    def remove_player(self, player_id: str):
+        for i, p in enumerate(self.players):
+            if p and p.id == player_id:
+                self.players[i] = None
+                return
+
+    def get_player_count(self):
+        return sum(1 for p in self.players if p is not None)
 
     def start_game(self):
-        if len(self.players) != 6:
+        if self.get_player_count() != 6:
             raise ValueError("Need 6 players")
         
         # Reset Deck
@@ -76,7 +79,8 @@ class Game:
         
         # Reset Player Hands
         for p in self.players:
-            p.hand = []
+            if p:
+                p.hand = []
             
         self.phase = GamePhase.DRAWING
         
@@ -86,7 +90,6 @@ class Game:
         
         # Determine Draw Start
         if self.dealer_index == -1:
-            # First game logic could be complex (Lift cards), but assuming p0 for simplicity or pre-determined
             self.dealer_index = 0
             
         self.next_draw_index = self.dealer_index
@@ -103,6 +106,9 @@ class Game:
         
         player_idx = self.next_draw_index
         player = self.players[player_idx]
+        if not player:
+            raise ValueError("Player missing in active game")
+            
         player.receive_cards([card])
         
         self.next_draw_index = (self.next_draw_index + 1) % 6

@@ -10,14 +10,27 @@ export async function createGame(roomName: string) {
     return res.json();
 }
 
-export async function joinGame(roomName: string, playerName: string) {
+export async function joinGame(roomName: string, playerName: string, seatIndex?: number) {
+    const body: any = { name: playerName };
+    if (seatIndex !== undefined) {
+        body.seat_index = seatIndex;
+    }
     const res = await fetch(`${API_BASE}/games/${roomName}/join`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: playerName })
+        body: JSON.stringify(body)
     });
     if (!res.ok) throw new Error(await res.text());
     return res.json(); // { player_id: string, team: number }
+}
+
+export async function getGameInfo(roomName: string) {
+    const res = await fetch(`${API_BASE}/games/${roomName}/state`);
+    if (!res.ok) {
+        // Just return null if not found
+        return null;
+    }
+    return res.json();
 }
 
 export async function startGame(roomName: string) {
