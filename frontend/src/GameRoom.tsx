@@ -6,6 +6,7 @@ import { useParams } from 'react-router-dom'; // Assuming I can add params parsi
 
 import { joinGame, startGame, getGameInfo } from './api';
 import { GameClient } from './GameClient';
+import { GamePhase } from './types';
 
 interface Props {
    gameId: string;
@@ -15,10 +16,47 @@ interface Props {
 
 export const GameRoom: React.FC<Props> = ({ gameId, mainPlayerId, mainPlayerName }) => {
     // List of connected players we are managing
-    const [clients, setClients] = useState<{id: string, name: string}[]>([
-        { id: mainPlayerId, name: mainPlayerName }
-    ]);
+    const [clients, setClients] = useState<{id: string, name: string}[]>(() => {
+        // Try to load from session storage
+        const key = `viiv_debug_clients_${gameId}`;
+        const stored = sessionStorage.getItem(key);
+        if (stored) {
+            try {
+                return JSON.parse(stored);
+            } catch (e) { console.error("Failed to parse clients", e); }
+        }
+        return [{ id: mainPlayerId, name: mainPlayerName }];
+    });
+    
+    // Save clients to SessionStorage whenever it changes
+    useEffect(() => {
+        sessionStorage.setItem(`viiv_debug_clients_${gameId}`, JSON.stringify(clients));
+    }, [clients, gameId]);
+
     const [activeTab, setActiveTab] = useState<string>(mainPlayerId);
+    const [phase, setPhase] = useState<GamePhase>(GamePhase.WAITING);
+
+    useEffect(() => {
+        const fetchInfo = async () => {
+            const info = await getGameInfo(gameId);
+            if (info) {
+                if (info.phase) setPhase(info.phase);
+                // Also update bots/clients list if needed?
+                // Currently 'clients' is local manager mainly for self + spawned bots.
+                // We don't query other human players into 'clients' tabs unless we want to multi-play.
+                // But for the 'Lobby' visualization, GameClient handles rendering opponents.
+                // The prompt asks: "when one player sits down, the other player should be able to see him".
+                // Seat visibility is handled by GameClient > renderPlayerSlot > checks players list.
+                // We just need to make sure GameClient re-fetches info periodically or on event.
+                // But wait, GameClient only calls getGameInfo ONCE.
+                // We should add polling there or here. 
+            }
+        };
+        
+        fetchInfo(); // Initial
+        const timer = setInterval(fetchInfo, 2000); // Poll every 2s for phase change
+        return () => clearInterval(timer);
+    }, [gameId]);
 
     const spawnBots = async () => {
         try {
@@ -49,8 +87,18 @@ export const GameRoom: React.FC<Props> = ({ gameId, mainPlayerId, mainPlayerName
     const handleStart = async () => {
         try {
             await startGame(gameId);
+            setPhase(GamePhase.DRAWING); // Optimistic update
         } catch (e) {
             alert(e);
+        }
+    };
+
+    const handleExit = () => {
+        if (confirm("Are you sure you want to exit?")) {
+            localStorage.removeItem("viiv_game_id");
+            localStorage.removeItem("viiv_player_id");
+            // Name kept for convenience
+            window.location.href = "/";
         }
     };
 
@@ -78,9 +126,16 @@ export const GameRoom: React.FC<Props> = ({ gameId, mainPlayerId, mainPlayerName
                             + 5 Bots (Debug)
                         </button>
                     )}
-                    <button onClick={handleStart} className="bg-red-700 px-3 py-1 rounded text-sm hover:bg-red-600 border border-red-500">
-                        Start Game
-                    </button>
+                    
+                    {phase === GamePhase.WAITING ? (
+                        <button onClick={handleStart} className="bg-red-700 px-3 py-1 rounded text-sm hover:bg-red-600 border border-red-500 shrink-0">
+                            Start Game
+                        </button>
+                    ) : (
+                        <button onClick={handleExit} className="bg-gray-700 px-3 py-1 rounded text-sm hover:bg-gray-600 border border-gray-500 shrink-0">
+                            Exit
+                        </button>
+                    )}
                 </div>
             </div>
 

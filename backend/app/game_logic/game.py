@@ -93,6 +93,21 @@ class Game:
             self.dealer_index = 0
             
         self.next_draw_index = self.dealer_index
+
+    def deal_cards(self):
+        """Pre-distribute all remaining cards to players."""
+        while len(self.deck.cards) > 0:
+            card_list = self.deck.draw(1)
+            if not card_list:
+                break
+            card = card_list[0]
+            
+            player_idx = self.next_draw_index
+            player = self.players[player_idx]
+            if player:
+                player.receive_cards([card])
+            
+            self.next_draw_index = (self.next_draw_index + 1) % 6
         
     def draw_next_card(self) -> Optional[Tuple[int, Card]]:
         if not self.deck.cards:

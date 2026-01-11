@@ -11,6 +11,44 @@ app = FastAPI()
 # Simple in-memory storage for games
 games: Dict[str, Game] = {}
 
+# Simple in-memory storage for users
+# username -> { "password": str, "active_game": str | None, "active_player_id": str | None }
+users_db: Dict[str, Dict] = {}
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+@app.post("/users/register")
+def register(user: UserRegister):
+    if user.username in users_db:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    users_db[user.username] = {
+        "password": user.password,
+        "active_game": None,
+        "active_player_id": None
+    }
+    return {"message": "Registered successfully"}
+
+@app.post("/users/login")
+def login(user: UserLogin):
+    if user.username not in users_db:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    stored = users_db[user.username]
+    if stored["password"] != user.password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+        
+    return {
+        "username": user.username,
+        "active_game": stored["active_game"],
+        "active_player_id": stored["active_player_id"]
+    }
+
 class ConnectionManager:
     def __init__(self):
         # game_id -> List[WebSocket]
@@ -52,63 +90,63 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 async def dealing_phase_task(game_id: str):
-    game = games.get(game_id)
-    if not game:
+    if game_id not in games:
         return
-
-    # Total cards to deal = 210 (start) - 6 (bottom) = 210
-    # Wait, simple math explanation: 216 total. 6 bottom. 210 for players.
-    # 6 players * 35 cards = 210.
+    game = games[game_id]
     
-    # We want 1 card per second for EACH player? Or total?
-    # Usually "1 card per second" speed means 1 card arrives at a player every second.
-    # So 6 cards distributed every second.
-    # Delay = 1/6 second.
-    delay = 1.0 / 6.0 
-
     try:
-        cards_dealt = 0
-        while True:
-            result = game.draw_next_card()
-            if not result:
-                break
-                
-            player_idx, card = result
-            player = game.players[player_idx]
+        # Pre-calculate hands (simulated draw)
+        game.deal_cards() 
+        
+        # Broadcast "GAME_STARTED" to switch frontend scenes
+        await manager.broadcast({
+            "type": "GAME_STARTED",
+            "phase": "DRAWING"
+        }, game_id)
+        
+        await asyncio.sleep(1) # Give frontend time to render board
+        
+        max_cards = max(len(p.hand) for p in game.players if p)
+        
+        for i in range(max_cards):
+            # Send the i-th card to each player
+            for p in game.players:
+                if p and i < len(p.hand):
+                    card = p.hand[i]
+                    card_data = {"suit": card.suit, "rank": card.rank, "id": card.id}
+                    await manager.send_personal_message({
+                        "type": "NEW_CARD",
+                        "card": card_data
+                    }, game_id, p.id)
             
-            # Send card to the specific player
-            await manager.send_personal_message({
-                "type": "NEW_CARD",
-                "card": {"suit": card.suit, "rank": card.rank, "id": card.id}
-            }, game_id, player.id)
+            await asyncio.sleep(0.2) # Drawing animation speed
             
-            cards_dealt += 1
-            await asyncio.sleep(delay)
-            
-        # Finish Drawing Phase
+        # End Drawing - Finalize Logic (Main Suit, Bottom Cards)
         final_info = game.finalize_drawing_phase()
+        
+        dealer_idx = final_info["dealer_idx"]
+        main_suit_val = final_info["main_suit"]
+        bottom_cards_list = final_info["bottom_cards"] # These are the cards given to dealer
+        
+        bottom_cards_formatted = [{"suit": c.suit, "rank": c.rank, "id": c.id} for c in bottom_cards_list]
         
         await manager.broadcast({
             "type": "DRAWING_COMPLETE",
-            "main_suit": final_info["main_suit"],
-            "dealer_idx": final_info["dealer_idx"]
+            "main_suit": main_suit_val,
+            "dealer_idx": dealer_idx
         }, game_id)
         
-        # Serialize bottom cards
-        bottom_cards_formatted = [{"suit": c.suit, "rank": c.rank, "id": c.id} for c in final_info["bottom_cards"]]
-
-        # REVEAL BOTTOM CARDS TO EVERYONE BEFORE EXCHANGE
+        # Reveal Bottom Cards
         await manager.broadcast({
             "type": "BOTTOM_CARDS_REVEAL",
             "bottom_cards": bottom_cards_formatted,
             "message": "Bottom cards revealed for 10 seconds."
         }, game_id)
 
-        # Wait 10 seconds
         await asyncio.sleep(10)
 
         # Notify Dealer about Bottom Cards and Start Exchange
-        dealer_p = game.players[final_info["dealer_idx"]]
+        dealer_p = game.players[dealer_idx]
         
         await manager.send_personal_message({
             "type": "EXCHANGE_START",
@@ -137,9 +175,19 @@ def join_game(game_id: str, player: PlayerJoin):
     if game_id not in games:
         raise HTTPException(status_code=404, detail="Game not found")
     
+    # Check if user exists (Optional consistency check, but we trust the name passed if logic is handled in frontend)
+    # Ideally frontend passes the logged-in username as 'player.name'
+    
     game = games[game_id]
     try:
         pid = f"player_{player.seat_index}" # ID bound to seat for simplicity
+        
+        # If this user was already playing elsewhere, clear it?
+        # Or better: Update user record
+        if player.name in users_db:
+             users_db[player.name]["active_game"] = game_id
+             users_db[player.name]["active_player_id"] = pid
+             
         game.add_player(pid, player.name, player.seat_index)
         
         # Safe access to player we just added
@@ -171,6 +219,10 @@ async def start_game(game_id: str, background_tasks: BackgroundTasks):
     if game_id not in games:
         raise HTTPException(status_code=404, detail="Game not found")
     game = games[game_id]
+    
+    if game.phase != GamePhase.WAITING:
+        raise HTTPException(status_code=400, detail="Game already started")
+        
     try:
         game.start_game()
         background_tasks.add_task(dealing_phase_task, game_id)
@@ -193,6 +245,23 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
         
     player_idx = game.players.index(player_obj)
     await manager.connect(websocket, game_id, player_id)
+
+    # Restore State for Reconnecting Players
+    if game.phase != GamePhase.WAITING:
+        hand_formatted = [{"suit": c.suit, "rank": c.rank, "id": c.id} for c in player_obj.hand]
+        bottom_cards_formatted = []
+        if game.phase == "EXCHANGE" and player_idx == game.dealer_index:
+             bottom_cards_formatted = [{"suit": c.suit, "rank": c.rank, "id": c.id} for c in game.bottom_cards]
+
+        await manager.send_personal_message({
+            "type": "RESTORE_STATE",
+            "phase": game.phase,
+            "hand": hand_formatted,
+            "main_suit": game.main_suit,
+            "dealer_idx": game.dealer_index,
+            "bottom_cards": bottom_cards_formatted,
+            "current_turn": game.current_turn_index
+        }, game_id, player_id)
     
     try:
         while True:

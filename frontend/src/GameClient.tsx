@@ -44,18 +44,27 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
     // Initial Setup
     useEffect(() => {
         // Fetch Player Names
-        getGameInfo(gameId).then(info => {
+        const updateInfo = async () => {
+            const info = await getGameInfo(gameId);
             if (info && info.seats) {
                 const map: any = {};
                 info.seats.forEach((s: any) => map[s.seat_index] = s);
                 setPlayers(map);
             }
-        });
+        };
+        
+        updateInfo();
+        // Poll for player names occasionally (e.g. someone joins late)
+        // Or better, rely on backend broadcasting "PLAYER_JOINED" event?
+        // Current backend relies on WS for game actions.
+        // Let's just poll for simplicity as requested "see him when he sits down".
+        const timer = setInterval(updateInfo, 3000); 
 
         // Connect WS
         const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
         const host = window.location.host; 
         const socket = new WebSocket(`${protocol}://${host}/ws/${gameId}/${playerId}`);
+             clearInterval(timer);
         ws.current = socket;
 
         socket.onopen = () => addLog("Connected");
@@ -89,8 +98,26 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
     const handleMessage = (msg: any) => {
         switch (msg.type) {
             case "NEW_CARD":
-                setHand(prev => [...prev, msg.card]);
+                setHand(prev => {
+                    // Avoid duplicates if re-connecting or state restored
+                    if (prev.some(c => c.id === msg.card.id)) return prev;
+                    return [...prev, msg.card];
+                });
                 setPhase(GamePhase.DRAWING);
+                break;
+            case "RESTORE_STATE":
+                setPhase(msg.phase);
+                setHand(msg.hand);
+                if (msg.main_suit) setMainSuit(msg.main_suit);
+                if (msg.dealer_idx !== undefined) setDealerIdx(msg.dealer_idx);
+                if (msg.current_turn !== undefined) setCurrentTurn(msg.current_turn);
+                if (msg.bottom_cards) {
+                    // If we are restoring during exchange, and we are the dealer, we might need to show bottom cards
+                    // or if reveal phase was active. 
+                    // For simplicity, just store them if provided.
+                    setBottomCards(msg.bottom_cards);
+                }
+                addLog("Game state restored from server");
                 break;
             case "DRAWING_COMPLETE":
                 if (msg.main_suit) setMainSuit(msg.main_suit);
@@ -183,6 +210,12 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
     };
 
     const exchangeCards = () => {
+         // Only dealer can exchange
+         if (myIdx !== dealerIdx) {
+             alert("Only the dealer handles the bottom cards.");
+             return;
+         }
+         
          if (selectedCardIds.size !== 6) {
              alert("Must select 6 cards");
              return;
@@ -311,7 +344,11 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
                       )}
                       
                       {phase === GamePhase.EXCHANGING && (
-                           <button onClick={exchangeCards} className="bg-purple-700 px-3 py-0.5 rounded text-white text-xs hover:bg-purple-600">Exchange</button>
+                           myIdx === dealerIdx ? (
+                               <button onClick={exchangeCards} className="bg-purple-700 px-3 py-0.5 rounded text-white text-xs hover:bg-purple-600">Exchange</button>
+                           ) : (
+                               <div className="text-yellow-400 text-xs italic animate-pulse">Dealer is exchanging cards...</div>
+                           )
                       )}
                       
                       {phase === GamePhase.PLAYING && currentTurn === myIdx && (
