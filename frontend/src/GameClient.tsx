@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Card, GamePhase, Suit, Rank } from './types';
 import { CardView } from './components/CardView';
-import { getGameInfo } from './api';
+import { getGameInfo, nextGame } from './api';
 // import { GameLogic } from './gameLogic'; // Logic moved to backend
 
 interface Props {
@@ -38,6 +38,7 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
     useEffect(() => { trickCardsRef.current = trickCards; }, [trickCards]);
 
     const [scores, setScores] = useState<{[key:number]: number}>({0:0, 1:0, 2:0});
+    const [teamLevels, setTeamLevels] = useState<{[key:number]: number}>({0:3, 1:3, 2:3});
     const [dealerIdx, setDealerIdx] = useState<number>(-1);
     const [players, setPlayers] = useState<{[key:number]: PlayerInfo}>({});
 
@@ -88,24 +89,47 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
     // HAND SORTING
     const sortedHand = [...hand].sort((a, b) => {
         const getScore = (c: Card) => {
+            // Helper for suit order within groups
+            let suitOrder = 0;
+            if (c.suit === Suit.SPADES) suitOrder = 40;
+            else if (c.suit === Suit.HEARTS) suitOrder = 30;
+            else if (c.suit === Suit.CLUBS) suitOrder = 20;
+            else if (c.suit === Suit.DIAMONDS) suitOrder = 10;
+            
             if (c.rank === Rank.BIG_JOKER) return 10000;
             if (c.rank === Rank.SMALL_JOKER) return 9000;
-            if (c.rank === currentLevel) return (c.suit === mainSuit) ? 8500 : 8000;
-            if (c.rank === Rank.TWO) return (c.suit === mainSuit) ? 7500 : 7000;
+            
+            // Level Cards: 8500 (Main) vs 8000+Suit (Non-Main)
+            if (c.rank === currentLevel) {
+                 return (c.suit === mainSuit) ? 8500 : (8000 + suitOrder);
+            }
+            
+            // Twos: 7500 (Main) vs 7000+Suit (Non-Main)
+            if (c.rank === Rank.TWO) {
+                 return (c.suit === mainSuit) ? 7500 : (7000 + suitOrder);
+            }
+            
+            // Main Suit Cards (non-special): 6000 + Rank
             if (mainSuit && c.suit === mainSuit) return 6000 + c.rank;
             
-            let suitScore = 0;
-            if (c.suit === Suit.SPADES) suitScore = 4000;
-            else if (c.suit === Suit.HEARTS) suitScore = 3000;
-            else if (c.suit === Suit.CLUBS) suitScore = 2000;
-            else if (c.suit === Suit.DIAMONDS) suitScore = 1000;
-            return suitScore + c.rank;
+            // Side Suits: 4000/3000/2000/1000 + Rank
+            return (suitOrder * 100) + c.rank;
         };
         return getScore(b) - getScore(a);
     });
 
     const handleMessage = (msg: any) => {
         switch (msg.type) {
+            case "GAME_STARTED":
+                // New game starting, update dealer info
+                setPhase(msg.phase);
+                setHand([]); // Reset hand
+                if (msg.dealer_idx !== undefined) setDealerIdx(msg.dealer_idx);
+                if (msg.current_level !== undefined) setCurrentLevel(msg.current_level);
+                if (msg.team_levels) setTeamLevels(msg.team_levels);
+                setScores({0:0, 1:0, 2:0}); // Reset scores
+                addLog(`Game Started. Dealer: Seat ${msg.dealer_idx}`);
+                break;
             case "NEW_CARD":
                 setHand(prev => {
                     // Avoid duplicates if re-connecting or state restored
@@ -120,6 +144,10 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
                 if (msg.main_suit) setMainSuit(msg.main_suit);
                 if (msg.dealer_idx !== undefined) setDealerIdx(msg.dealer_idx);
                 if (msg.current_turn !== undefined) setCurrentTurn(msg.current_turn);
+                if (msg.current_level !== undefined) setCurrentLevel(msg.current_level);
+                if (msg.team_levels) setTeamLevels(msg.team_levels);
+                if (msg.trick_cards) setTrickCards(msg.trick_cards);
+                
                 if (msg.bottom_cards) {
                     // If we are restoring during exchange, and we are the dealer, we might need to show bottom cards
                     // or if reveal phase was active. 
@@ -190,7 +218,6 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
                  break;
             case "GAME_OVER":
                  setPhase(GamePhase.FINISHED);
-                 alert("Game Over!");
                  break;
             case "ERROR":
                  alert(msg.message);
@@ -242,27 +269,84 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
 
              // 2. Play Phase
              if (phase === GamePhase.PLAYING && currentTurn === myIdx) {
-                 // Determine strategy
                  let cardsToPlay: Card[] = [];
                  
-                 // If leading (trickCards empty OR full from previous trick pending clear) -> Play 1st card
-                 const isLeading = trickCards.length === 0 || trickCards.length === 6;
+                 // Helper: Find pairs in a list of cards
+                 const findPairs = (sourceCards: Card[]) => {
+                     const pairs: Card[][] = [];
+                     const used = new Set<string>();
+                     for (let i = 0; i < sourceCards.length; i++) {
+                         if (used.has(sourceCards[i].id)) continue;
+                         for (let j = i + 1; j < sourceCards.length; j++) {
+                             if (used.has(sourceCards[j].id)) continue;
+                             if (sourceCards[i].suit === sourceCards[j].suit && sourceCards[i].rank === sourceCards[j].rank) {
+                                 pairs.push([sourceCards[i], sourceCards[j]]);
+                                 used.add(sourceCards[i].id);
+                                 used.add(sourceCards[j].id);
+                                 break;
+                             }
+                         }
+                     }
+                     return pairs;
+                 };
+
+                 const isLeading = trickCards.length === 0;
                  
                  if (isLeading) {
-                     if (sortedHand.length > 0) cardsToPlay = [sortedHand[sortedHand.length - 1]]; // Play weakest (last in sorted)
+                     // Try to play a pair first (Weakest pair)
+                     const pairs = findPairs(sortedHand);
+                     if (pairs.length > 0) {
+                         cardsToPlay = pairs[pairs.length - 1];
+                     } else {
+                         // Play weakest single
+                         if (sortedHand.length > 0) cardsToPlay = [sortedHand[sortedHand.length - 1]]; 
+                     }
                  } else {
                      // Following
-                     const leadCard = trickCards[0].cards[0];
+                     const leadPlay = trickCards[0]; 
+                     const leadCards = leadPlay.cards;
+                     const count = leadCards.length;
+                     const leadCard = leadCards[0];
                      const leadSuit = getEffectiveSuit(leadCard); 
                      
-                     // Find cards matching suit
+                     // Find cards matching suit (Strong -> Weak)
                      const matches = sortedHand.filter(c => getEffectiveSuit(c) === leadSuit);
                      
-                     if (matches.length > 0) {
-                         cardsToPlay = [matches[matches.length - 1]]; // Follow with weakest valid
-                     } else {
-                         // No match, discard weakest
-                         if (sortedHand.length > 0) cardsToPlay = [sortedHand[sortedHand.length - 1]];
+                     if (count === 1) {
+                         // Following single
+                         if (matches.length > 0) {
+                             cardsToPlay = [matches[matches.length - 1]]; 
+                         } else {
+                             if (sortedHand.length > 0) cardsToPlay = [sortedHand[sortedHand.length - 1]];
+                         }
+                     } else if (count >= 2) {
+                         // Following Check for Pair
+                         const isPairLead = leadCards.length === 2 && leadCards[0].rank === leadCards[1].rank;
+                         let handled = false;
+                         
+                         if (isPairLead) {
+                             const suitPairs = findPairs(matches);
+                             if (suitPairs.length > 0) {
+                                  cardsToPlay = suitPairs[suitPairs.length - 1]; // Weakest matching pair
+                                  handled = true;
+                             }
+                         }
+                         
+                         if (!handled) {
+                             // Dump logic: Suit (Weak->Strong) then Others (Weak->Strong)
+                             let currentPick: Card[] = [];
+                             const weakMatches = [...matches].reverse(); 
+                             currentPick.push(...weakMatches);
+                             
+                             if (currentPick.length > count) currentPick = currentPick.slice(0, count);
+                             
+                             if (currentPick.length < count) {
+                                 const others = sortedHand.filter(c => getEffectiveSuit(c) !== leadSuit).reverse();
+                                 const needed = count - currentPick.length;
+                                 currentPick.push(...others.slice(0, needed));
+                             }
+                             cardsToPlay = currentPick;
+                         }
                      }
                  }
 
@@ -271,7 +355,6 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
                          action: "PLAY_CARDS",
                          card_ids: cardsToPlay.map(c => c.id)
                      }));
-                     // addLog(`Auto Playing ${cardsToPlay.length} cards`);
                  }
              }
         };
@@ -408,9 +491,15 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
             <div className="h-8 bg-black/40 flex justify-between px-4 items-center text-white text-xs z-20">
                 <div>Room: {gameId} | Phase: {phase} | Level: {currentLevel} | Main: {mainSuit || "?"}</div>
                 <div className="flex gap-4 font-mono">
-                     <div className="text-red-300">Team 0: {scores[0]}</div>
-                     <div className="text-blue-300">Team 1: {scores[1]}</div>
-                     <div className="text-yellow-300">Team 2: {scores[2]}</div>
+                     <div className="text-red-300">
+                         {players[dealerIdx]?.team === 0 ? "★ " : ""}Team 0 (Lv {teamLevels[0]}): {scores[0]}
+                     </div>
+                     <div className="text-blue-300">
+                         {players[dealerIdx]?.team === 1 ? "★ " : ""}Team 1 (Lv {teamLevels[1]}): {scores[1]}
+                     </div>
+                     <div className="text-yellow-300">
+                         {players[dealerIdx]?.team === 2 ? "★ " : ""}Team 2 (Lv {teamLevels[2]}): {scores[2]}
+                     </div>
                 </div>
             </div>
 
@@ -435,6 +524,31 @@ export const GameClient: React.FC<Props> = ({ gameId, playerId, isActive }) => {
             <div className="absolute top-10 left-2 w-48 max-h-32 overflow-y-auto bg-black/40 text-xxs text-green-300 pointer-events-none rounded p-1">
                  {logs.map((L, i) => <div key={i}>{L}</div>)}
             </div>
+            
+            {/* Game Over / Next Game Overlay */}
+            {phase === GamePhase.FINISHED && (
+                <div className="absolute inset-0 z-50 bg-black/80 flex flex-col items-center justify-center">
+                    <h1 className="text-4xl text-yellow-500 font-bold mb-8">Game Over!</h1>
+                    <div className="text-white text-xl mb-8 flex flex-col gap-2">
+                         <div className={players[dealerIdx]?.team === 0 ? "text-yellow-400 font-bold" : ""}>
+                             Team 0 (Lv {teamLevels[0]}): {scores[0]} {players[dealerIdx]?.team === 0 && "(Dealer)"}
+                         </div>
+                         <div className={players[dealerIdx]?.team === 1 ? "text-yellow-400 font-bold" : ""}>
+                             Team 1 (Lv {teamLevels[1]}): {scores[1]} {players[dealerIdx]?.team === 1 && "(Dealer)"}
+                         </div>
+                         <div className={players[dealerIdx]?.team === 2 ? "text-yellow-400 font-bold" : ""}>
+                             Team 2 (Lv {teamLevels[2]}): {scores[2]} {players[dealerIdx]?.team === 2 && "(Dealer)"}
+                         </div>
+                    </div>
+                    <button 
+                        onClick={() => nextGame(gameId)}
+                        className="bg-green-600 hover:bg-green-500 text-white font-bold py-3 px-8 rounded-lg text-lg shadow-lg transform transition hover:scale-105"
+                    >
+                        Start Next Game
+                    </button>
+                    <div className="mt-4 text-gray-400 text-sm">Last winner becomes the new Dealer.</div>
+                </div>
+            )}
 
             {/* My Hand Area (Docked Bottom) */}
             <div className="h-40 bg-gray-900/90 border-t border-yellow-600 relative z-30 flex flex-col items-center">

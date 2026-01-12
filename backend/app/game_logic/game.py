@@ -45,6 +45,7 @@ class Game:
         self.points_team_1 = 0 
         
         self.scores = {0: 0, 1: 0, 2: 0} # Scores for team 0, 1, 2
+        self.team_levels = {0: 3, 1: 3, 2: 3} # Persistent levels for teams
         
     def add_player(self, player_id: str, name: str, seat_idx: int):
         if seat_idx < 0 or seat_idx >= 6:
@@ -87,6 +88,8 @@ class Game:
         # Reset Round State
         self.declaration = None
         self.main_suit = None
+        self.scores = {0: 0, 1: 0, 2: 0} # Reset scores for new game
+        self.current_trick = []
         
         # Determine Draw Start
         if self.dealer_index == -1:

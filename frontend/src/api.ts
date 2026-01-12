@@ -41,6 +41,14 @@ export async function startGame(roomName: string) {
     return res.json();
 }
 
+export async function nextGame(roomName: string) {
+    const res = await fetch(`${API_BASE}/games/${roomName}/next`, {
+        method: "POST"
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+}
+
 export async function getState(roomName: string, playerId: string) {
      const res = await fetch(`${API_BASE}/games/${roomName}/state/${playerId}`);
      if (!res.ok) throw new Error(await res.text());

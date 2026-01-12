@@ -20,12 +20,24 @@ export const GameRoom: React.FC<Props> = ({ gameId, mainPlayerId, mainPlayerName
         // Try to load from session storage
         const key = `viiv_debug_clients_${gameId}`;
         const stored = sessionStorage.getItem(key);
+        let list: {id: string, name: string}[] = [];
         if (stored) {
             try {
-                return JSON.parse(stored);
+                list = JSON.parse(stored);
             } catch (e) { console.error("Failed to parse clients", e); }
         }
-        return [{ id: mainPlayerId, name: mainPlayerName }];
+        
+        // Ensure mainPlayerId is in the list (Critical for "Black Screen" fix if switching users)
+        if (!list.some(c => c.id === mainPlayerId)) {
+            // If the list exists but we are new, append or prepend? 
+            // Better to append so we don't mess up existing bot order perception?
+            list.push({ id: mainPlayerId, name: mainPlayerName });
+        }
+        
+        if (list.length === 0) {
+            return [{ id: mainPlayerId, name: mainPlayerName }];
+        }
+        return list;
     });
 
     // Make Auto-Play default for Bots?

@@ -14,7 +14,7 @@ class Player:
 
     def receive_cards(self, cards: List[Card]):
         self.hand.extend(cards)
-        self.sort_hand()
+        # self.sort_hand() # Do not sort, keep deal order for streaming
 
     def remove_cards(self, card_ids: List[str]) -> List[Card]:
         removed = []

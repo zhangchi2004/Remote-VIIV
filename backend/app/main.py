@@ -101,7 +101,10 @@ async def dealing_phase_task(game_id: str):
         # Broadcast "GAME_STARTED" to switch frontend scenes
         await manager.broadcast({
             "type": "GAME_STARTED",
-            "phase": "DRAWING"
+            "phase": "DRAWING",
+            "dealer_idx": game.dealer_index,
+            "current_level": game.current_level,
+            "team_levels": game.team_levels
         }, game_id)
         
         await asyncio.sleep(1) # Give frontend time to render board
@@ -119,7 +122,7 @@ async def dealing_phase_task(game_id: str):
                         "card": card_data
                     }, game_id, p.id)
             
-            await asyncio.sleep(0.2) # Drawing animation speed
+            await asyncio.sleep(0.8) # Drawing animation speed
             
         # End Drawing - Finalize Logic (Main Suit, Bottom Cards)
         final_info = game.finalize_drawing_phase()
@@ -211,7 +214,9 @@ def get_game_state(game_id: str):
              
     return {
         "phase": game.phase,
-        "seats": seats
+        "seats": seats,
+        "dealer_idx": game.dealer_index,
+        "team_levels": game.team_levels
     }
 
 @app.post("/games/{game_id}/start")
@@ -227,6 +232,89 @@ async def start_game(game_id: str, background_tasks: BackgroundTasks):
         game.start_game()
         background_tasks.add_task(dealing_phase_task, game_id)
         return {"message": "Game started", "phase": game.phase}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/games/{game_id}/next")
+async def next_game(game_id: str, background_tasks: BackgroundTasks):
+    if game_id not in games:
+        raise HTTPException(status_code=404, detail="Game not found")
+    game = games[game_id]
+    
+    if game.phase != GamePhase.FINISHED:
+        raise HTTPException(status_code=400, detail="Game not finished yet")
+
+    try:
+        # Determine Current Dealer Team
+        current_dealer_idx = game.dealer_index
+        dealer_team = game.players[current_dealer_idx].team_id
+        
+        # Determine Scores of Defenders
+        # Teams are 0, 1, 2
+        # Defender teams are the ones != dealer_team
+        defender_teams = [t for t in [0, 1, 2] if t != dealer_team]
+        
+        max_defender_score = 0
+        winning_defender_team = -1
+        
+        for t in defender_teams:
+            score = game.scores.get(t, 0)
+            if score > max_defender_score:
+                max_defender_score = score
+                winning_defender_team = t
+            elif score == max_defender_score and score >= 130:
+                # Tie-break logic if both > 130? 
+                # Rule 9.7.3: "last scorer". We don't track usage.
+                # Simplified: Stick with the first found or arbitrary.
+                pass
+
+        new_dealer_idx = -1
+        
+        # Rule 1: None of defender teams reach 130
+        if max_defender_score < 130:
+            # Dealer Team Defends Successfully
+            # Next Dealer is partner (Same team, other player)
+            # Find teammate
+            for i in range(1, 6):
+                idx = (current_dealer_idx + i) % 6
+                if game.players[idx].team_id == dealer_team:
+                    new_dealer_idx = idx
+                    break
+            
+            # Level Up Dealer Team
+            game.team_levels[dealer_team] += 1
+            game.current_level = game.team_levels[dealer_team]
+            
+        else:
+            # Rule 2: Defenders Win (At least one team >= 130)
+            # Winning Defender Team is the one with max_defender_score (which is >= 130)
+            # If both have same score >= 130, winning_defender_team is set to one of them above.
+            
+            # Next Dealer: "member that is behind the dealer" belonging to winning team
+            # Search clockwise from dealer
+            for i in range(1, 6):
+                idx = (current_dealer_idx + i) % 6
+                if game.players[idx].team_id == winning_defender_team:
+                    new_dealer_idx = idx
+                    break
+            
+            # Level Switch (Use winning team's level, no increment)
+            game.current_level = game.team_levels[winning_defender_team]
+            
+        # Apply New Dealer
+        game.dealer_index = new_dealer_idx
+        
+        # 3. Start Game
+        game.phase = GamePhase.WAITING
+        game.start_game()
+        background_tasks.add_task(dealing_phase_task, game_id)
+        
+        return {
+            "message": "Next game started", 
+            "new_dealer": new_dealer_idx,
+            "current_level": game.current_level,
+            "team_levels": game.team_levels
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -253,6 +341,13 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
         if game.phase == "EXCHANGE" and player_idx == game.dealer_index:
              bottom_cards_formatted = [{"suit": c.suit, "rank": c.rank, "id": c.id} for c in game.bottom_cards]
 
+        # Format Current Trick
+        current_trick_formatted = []
+        for p_idx, cards in game.current_trick:
+             cards_data = [{"suit": c.suit, "rank": c.rank, "id": c.id} for c in cards]
+             current_trick_formatted.append({"player": p_idx, "cards": cards_data})
+
+        # Validate message type
         await manager.send_personal_message({
             "type": "RESTORE_STATE",
             "phase": game.phase,
@@ -260,7 +355,10 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str, player_id: str)
             "main_suit": game.main_suit,
             "dealer_idx": game.dealer_index,
             "bottom_cards": bottom_cards_formatted,
-            "current_turn": game.current_turn_index
+            "current_turn": game.current_turn_index,
+            "current_level": game.current_level,
+            "team_levels": game.team_levels,
+            "trick_cards": current_trick_formatted
         }, game_id, player_id)
     
     try:
@@ -376,7 +474,9 @@ def get_state(game_id: str, player_id: str):
         "hand": [str(c) for c in p.hand], # Simplified representation
         "current_main_suit": game.main_suit,
         "current_level": game.current_level,
-        "scores": game.scores
+        "scores": game.scores,
+        "dealer_idx": game.dealer_index,
+        "team_levels": game.team_levels
     }
 
 if __name__ == "__main__":
